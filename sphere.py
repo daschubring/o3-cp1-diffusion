@@ -5,6 +5,18 @@ from scipy.special import eval_legendre, i0e, i1e, eval_jacobi
 zVec = np.array([0., 0., 1.])
 yVec = np.array([0., 1., 0.])
 
+#the boundary between large and short times for heat kernel distribution and score
+tThresh = 0.15
+tThreshScore = 0.137
+
+#default harmonic truncations
+lDist = 8
+lScore = 10
+
+#theta above which special handling takes place at short times
+thCheck = 2.90569
+thCheckScore = 2.84627
+
 def norm(v):
     return np.linalg.norm(v, axis=-1, keepdims=True)
 
@@ -12,55 +24,69 @@ def normalize(v):
     return v/norm(v)
 
 def dot(v,w):
-    out = np.sum(v * w, axis=-1)
+    out = np.sum(v * w, axis=-1, keepdims=True)
     return out
 
-def hkScalar(mUnit, t):
+def tangent(x, x0):
     """
-    Sample heat kernel at time t centered on unit vector mUnit
-    Uses rejection sampling compared to a von Mises-Fisher distribution
-    Uses scalar quantities. Not suitable for batched inputs
+    Tangent vector at x pointing towards x0. Magnitude sin theta
     """
+    cosTh = dot(x, x0)
+    return x0 - cosTh*x
 
-    kappa = 1/(2*t)
+def randomPerp(mUnit):
+    # trial perpendicular
+    w = np.cross(zVec, mUnit)
+    
+    # If mUnit is parallel to z, use y instead as the reference axis
+    wNorm = norm(w)
+    parallelToZ = wNorm[..., 0] < 1e-12
+    w[parallelToZ] = np.cross(yVec, mUnit[parallelToZ])
 
-    while True:
-        nProp = vMF(mUnit, kappa)
-        cosTh = dot(nProp, mUnit)
+    # Create orthonormal basis
+    wUnit = normalize(w)
+    xUnit = np.cross(mUnit,wUnit)
 
-        acceptProb = (
-            hkDistScalar(cosTh, t)
-            / (rejection(t)*vMFDist(cosTh, kappa))
-        )
+    # Sample random angle
+    phi = 2*np.pi*np.random.random(wNorm.shape)
 
-        if np.random.random() < acceptProb:
-            return nProp
+    # Rotate wUnit
+    return np.cos(phi)*wUnit + np.sin(phi)*xUnit 
+
+def broadcastFix(vector, scalar):
+    vectorShape = np.broadcast(vector, scalar).shape
+    scalarShape = vectorShape[:-1] + (1,)
+
+    vector = np.broadcast_to(vector, vectorShape)
+    scalar = np.broadcast_to(scalar, scalarShape)
+
+    return vector, scalar
 
 def hk(mUnit, t):
     """
-    Sample the S^2 heat kernel for a batch of mean directions.
+    Sample the S^2 heat kernel
     """
 
-    mUnit = np.asarray(mUnit)
+    mUnit, t = broadcastFix(mUnit, t)
+    
     samples = np.empty_like(mUnit)
 
     kappa = 1/(2*t)
+
+    #while loop acting on indices that have not had an accepted proposal
     remaining = np.arange(len(mUnit))
-
     while len(remaining) > 0:
+        tLeft = t[remaining]
+        kappaLeft = kappa[remaining]
+        mLeft = mUnit[remaining]
 
-        means = mUnit[remaining]
-        kappaBatch = np.full((len(remaining), 1), kappa)
+        #propose a vector from vMF
+        nProp = vMF(mLeft, kappaLeft)
+        cosTh = dot(nProp, mLeft)
 
-        nProp = vMF(means, kappaBatch)
-        cosTh = dot(nProp, means).ravel()
+        acceptProb = (hkDist(cosTh, tLeft) / (rejection(tLeft)*vMFDist(cosTh, kappaLeft))).ravel()
 
-        acceptProb = (
-            hkDist(cosTh, t)
-            / (rejection(t)*vMFDist(cosTh, kappa))
-        )
-
-        accepted = np.random.random(len(remaining)) < acceptProb
+        accepted = np.random.random(acceptProb.shape) < acceptProb
 
         samples[remaining[accepted]] = nProp[accepted]
         remaining = remaining[~accepted]
@@ -69,55 +95,29 @@ def hk(mUnit, t):
 
 def vMF(mUnit, kappa):
     """
-    Sample von Mises-Fisher distribution about a batch of mean unit vectors mUnit (should work for a single vector too), with concentration parameter kappa
+    Sample von Mises-Fisher distribution about unit vector mUnit, with concentration parameter kappa
     """
 
-    # Convert Python lists/scalars to numpy arrays.
-    # WARNING: for batched use this function assumes mUnit has shape (...,3)
-    # and kappa has shape (...,1), so that scalar quantities broadcast over vectors.
-    mUnit = np.asarray(mUnit, dtype=float)
-    kappa = np.asarray(kappa, dtype=float)
-
-    # WARNING: mUnit is assumed to contain unit vectors and kappa is assumed nonnegative.
+    mUnit, kappa = broadcastFix(mUnit, kappa)
 
     # mask that locates small kappa
     smallKappa = np.abs(kappa) < 1e-8
     regular = ~smallKappa
     
-    #sample random variables that will be used to construct the new spin
+    #random variable to construct cosTh
     chi = np.random.random(kappa.shape)
-    phi = 2*np.pi*np.random.random(kappa.shape)
+    cosTh = np.empty(kappa.shape, dtype=float)
 
-    #Consider the equilibrium distribution for cosTh, the dot product of v and mUnit
-    cosTh = np.empty_like(kappa, dtype=float)
-
-    # For kappa -> 0, vMF becomes uniform on the sphere, so cosTh is uniform on [-1,1]
+    #for smallKappa, cosTh is uniform
     cosTh[smallKappa] = 2*chi[smallKappa] - 1
 
-    # Algebraically equivalent to the inverse-CDF expression, but unlike expressions
-    # containing exp(kappa), this remains well behaved for very large kappa.
-    # exp(-2*kappa) may underflow to zero for large kappa; this is harmless.
-    cosTh[regular] = 1 + (1/kappa[regular])*np.log(
-        chi[regular] + (1-chi[regular])*np.exp(-2*kappa[regular])
-    )
+    #for regular, we use the vMF distribution
+    cosTh[regular] = 1 + (1/kappa[regular])*np.log(chi[regular] + (1-chi[regular])*np.exp(-2*kappa[regular]))
 
     cosTh = np.clip(cosTh,-1,1)
     sinTh = np.sqrt(1 - cosTh**2)
 
-    w = np.cross(zVec, mUnit)
-    
-    # If mUnit is parallel to z, use y instead as the reference axis
-    # WARNING: this assumes norm(w) retains a final singleton axis, e.g. shape (...,1).
-    wNorm = norm(w)
-    parallelToZ = wNorm[..., 0] < 1e-12
-
-    if np.any(parallelToZ):
-       w[parallelToZ] = np.cross(yVec, mUnit[parallelToZ])
-         
-    wUnit = normalize(w)
-    xUnit = np.cross(mUnit,wUnit)
-
-    return cosTh*mUnit + sinTh*(np.cos(phi)*wUnit + np.sin(phi)*xUnit)
+    return cosTh*mUnit + sinTh*randomPerp(mUnit)
 
 #normalized von Mises-Fisher density on S^2 as a function of cos(theta)
 def vMFDist(cosTh, kappa):
@@ -153,64 +153,50 @@ rejectionSafety = 0.01
 def rejection(t):
 
     t = np.asarray(t, dtype=float)
+    mFactor = np.empty_like(t)
+    
+    small = t < 0.15
+    mFactor[small] = 0.5*t[small] + 1
+    
+    large = t > 1.2
+    tBig = t[large]
+    mFactor[large] = tBig*np.expm1(1/tBig) * (1 - 3*np.exp(-2*tBig) + 5*np.exp(-6*tBig))
+    
+    justRight = ~small & ~large
+    mFactor[justRight] = np.interp(t[justRight], rejectionT, rejectionM) + rejectionSafety * ((1.2-t[justRight])/1.1 + .1*(t[justRight]-0.1)/1.1)
+    # I'm linearly decreasing rejectionSafety so that rejection(t) is closer to continuous at 1.2
 
-    if t < 0.15:
-        return 1 + 0.5*t
-
-    elif t > 1.2:
-        return (
-            t*np.expm1(1/t)
-            * (1 - 3*np.exp(-2*t) + 5*np.exp(-6*t))
-        )
-
-    else:
-        return np.interp(t, rejectionT, rejectionM) + rejectionSafety * ((1.2-t)/1.1 + .1*(t-0.1)/1.1)
-        # I'm linearly decreasing rejectionSafety so that rejection(t) is closer to continuous at 1.2
-
+    return mFactor
+        
 #the heat kernel distribution function, which selects from a number of approximations depending on cosTh and t
 def hkDist(cosTh, t):
     """
-    Practical S^2 heat-kernel density used for sampling. cosTh is assumed to be batched
+    Practical S^2 heat-kernel density used for sampling.
     """
+    cosTh = np.asarray(cosTh, dtype=float)
+    cosTh, t = np.broadcast_arrays(cosTh, t)
 
-    #cosTh = np.asarray(cosTh, dtype=float)
     th = np.arccos(np.clip(cosTh, -1, 1))
+    dist = np.empty_like(cosTh)
 
-    # spectral representation for moderate and large diffusion times
-    if t >= 0.15:
-        return hkSpectralAdaptive(cosTh, t)
+    # harmonic sum for large t
+    largeT = t > tThresh
+    dist[largeT] = hkSpectral(cosTh[largeT], t[largeT], lDist)
 
-    # short-time MPSD representation
-    dist = hkMPSD(th, t)
+    # MPSD representation for small t
+    smallT = ~largeT
+    dist[smallT] = hkMPSD(th[smallT], t[smallT])
 
-    # only check the boundary-layer cutoff in the tiny antipodal region
-    thCheck = 2.90569
-    checkBL = th > thCheck
+    # correct antipodal boundary layer where needed
+    checkBL = smallT & (th > thCheck)
 
     if np.any(checkBL):
-        useBL = checkBL & (th > thBL(t))
-        dist[useBL] = hkBL(th[useBL], t)
+        useBL = np.zeros_like(checkBL, dtype=bool)
+        useBL[checkBL] = th[checkBL] > thBL(t[checkBL])
+
+        dist[useBL] = hkBL(th[useBL], t[useBL])
 
     return dist
-
-def hkDistScalar(cosTh, t):
-    """
-    Practical S^2 heat-kernel density used for sampling. cosTh is assumed to be a single scalar value
-    """
-
-    #cosTh = np.asarray(cosTh, dtype=float)
-    th = np.arccos(np.clip(cosTh, -1, 1))
-
-    # spectral representation for moderate and large diffusion times
-    if t >= 0.15:
-        return hkSpectralAdaptive(cosTh, t)
-
-    # only check the boundary-layer cutoff in the tiny antipodal region
-    thCheck = 2.90569
-    if th > thCheck and th > thBL(t) :
-        return hkBL(th, t)
-
-    return hkMPSD(th, t)
 
 def hkScore(cosTh, t):
     """
@@ -218,26 +204,32 @@ def hkScore(cosTh, t):
     """
 
     cosTh = np.asarray(cosTh, dtype=float)
+    cosTh, t = np.broadcast_arrays(cosTh, t)
+
     th = np.arccos(np.clip(cosTh, -1, 1))
+    score = np.empty_like(cosTh)
 
-    # spectral representation for moderate and large diffusion times
-    if t > 0.137:
-        return hkSpectralAdaptiveScore(cosTh, t)
+    # harmonic sum for large t
+    largeT = t > tThreshScore
+    score[largeT] = hkSpectralScore(cosTh[largeT], t[largeT], lScore)
 
-    # short-time MPSD representation
-    score = hkMPSDScore(th, t) + hkMPSDScoreAsymp(th, t)
+    # MPSD representation for small t
+    smallT = ~largeT
+    score[smallT] = hkMPSDScore(th[smallT], t[smallT])
 
-    # only check the boundary-layer cutoff in the tiny antipodal region
-    thCheck = 2.84627
-    checkBL = th > thCheck
+    # correct antipodal boundary layer where needed
+    checkBL = smallT & (th > thCheckScore)
 
     if np.any(checkBL):
-        useBL = checkBL & (th > thBLScore(t))
-        score[useBL] = hkBLScore(th[useBL], t)
+        useBL = np.zeros_like(checkBL, dtype=bool)
+        useBL[checkBL] = th[checkBL] > thBLScore(t[checkBL])
+
+        score[useBL] = hkBLScore(th[useBL], t[useBL])
 
     return score
 
-#Individual approximations used in hkDist:
+#---------------------------------
+# Spectral sum approximation (adaptive functions for scalar t are further below)
 
 def hkSpectral(cosTh, t, lMax):
     """S^2 heat kernel from the spherical-harmonic expansion."""
@@ -277,42 +269,8 @@ def hkSpectralScore(cosTh, t, lMax):
 
     return dhk/hk    
 
-# minimum t for which each lMax is sufficiently accurate
-# (so lMax=0 is good enough for t > 6.2, lMax=1 is for 6.2 > t > 2.2 etc.)
-# the minimum t for the score is set using an independent bound on the error
-# So lMax=1 is good enough for t > 2.51, lMax=2 is for 2.51 > t > 1.06 etc.
-spectralTMin = [6.2, 2.2, 1.1, 0.65, 0.44, 0.32, 0.24, 0.19, 0.15, 0.12, 0.1]
-spectralTMinScore = [2.51, 1.06, 0.619, 0.423, 0.317, 0.252, 0.208, 0.177, 0.154, 0.135]
-
-def lMaxValue(t):
-    for lMax in range(len(spectralTMin)):
-        if t >= spectralTMin[lMax]:
-            return lMax
-
-    raise ValueError(
-        f"Spectral approximation not calibrated below t={spectralTMin[-1]}"
-    )
-
-def lMaxValueScore(t):
-    for l in range(len(spectralTMinScore)):
-        if t >= spectralTMin[l]:
-            return l+1
-
-    raise ValueError(
-        f"Spectral approximation not calibrated below t={spectralTMin[-1]}"
-    )
-    
-def hkSpectralAdaptive(cosTh, t):
-    """
-    Spectral S^2 heat kernel with lMax chosen from calibrated
-    accuracy thresholds.
-    """
-
-    return hkSpectral(cosTh, t, lMaxValue(t))
-
-def hkSpectralAdaptiveScore(cosTh, t):
-
-    return hkSpectralScore(cosTh, t, lMaxValueScore(t))
+#---------------------------------
+# MPSD approximation
 
 def hkMPSD(th, t):
     """
@@ -383,7 +341,6 @@ def hkMPSDScore(th, t):
     )
     
     return np.where(small, scoreSmall, score)
-    
 
 def hkMPSDScoreAsymp(th, t):
     """Asymptotic corrections to the score of the heat kernel up to O(t^3)."""
@@ -398,34 +355,9 @@ def hkMPSDScoreAsymp(th, t):
     )
 
     return -dCorrection/(hkMPSDAsymp(th,t)*np.sinc(th / np.pi))
-    
 
-def hkPi(t, nMin=-1, nMax=0):
-    """Camporesi image sum evaluated exactly at theta = pi,
-       truncated to nMin <= n <= nMax.
-    """
-    
-    imageSum = 0.0
-
-    for n in range(nMin, nMax + 1):
-        sign = 1 if n % 2 == 0 else -1
-
-        imageSum += (
-            sign
-            * (2 * n + 1)
-            * np.exp(
-                -np.pi**2 * (2 * n + 1)**2 / (4 * t)
-            )
-        )
-
-    prefactor = (
-        np.pi**2
-        * np.exp(t / 4)
-        / (4 * np.pi * t)**1.5
-    )
-
-    return prefactor * imageSum
-
+#---------------------------------
+# Boundary layer handling for short time
 
 thBLT = np.array([0, 0.01, 0.02, 0.025, 0.05, 0.075, 0.1, 0.125, 0.15], dtype=float)
 thBLVals = np.array([np.pi, 3.07217, 3.03987, 3.02685, 2.97632, 2.93829, 2.90671, 2.87929, 2.85491], dtype=float)
@@ -438,10 +370,10 @@ def thBL(t):
     Calibrated for 0.01 <= t <= 0.15.
     """
 
-    if t < 0:
+    if np.any(t < 0):
         raise ValueError("t must be positive")
 
-    elif t > thBLT[-1]:
+    elif np.any(t > thBLT[-1]):
         raise ValueError("thBL is only defined for the short-time regime t <= 0.15")
 
     else:
@@ -452,10 +384,10 @@ def thBLScore(t):
     Boundary between the MPSD and antipodal boundary-layer regions appropriate for score
     """
 
-    if t < 0:
+    if np.any(t < 0):
         raise ValueError("t must be positive")
 
-    elif t > thBLScoreT[-1]:
+    elif np.any(t > thBLScoreT[-1]):
         raise ValueError("thBL is only defined for the short-time regime t <= 0.15")
 
     else:
@@ -474,8 +406,8 @@ def hkBL(th, t, method="zero"):
     if method == "zero":
         return np.zeros_like(th, dtype=float)
 
-    elif method == "pi":
-        return np.full_like(th, hkPi(t), dtype=float)
+    #elif method == "pi":
+    #    return np.full_like(th, hkPi(t), dtype=float)
 
     elif method == "asymptotic":
         return hkBLasymptotic(th, t)
@@ -543,3 +475,111 @@ def hkBLScore(th, t):
         * deltaOverSinDelta
         * numeratorOverZ/denominator
     )
+
+#---------------------------------
+# Functions intended for use with scalar t
+    
+def hkScalar(mUnit, t):
+    """
+    Sample heat kernel at time t centered on unit vector mUnit
+    Uses rejection sampling compared to a von Mises-Fisher distribution
+    Uses scalar quantities. Not suitable for batched inputs
+    """
+
+    kappa = 1/(2*t)
+
+    while True:
+        nProp = vMF(mUnit, kappa)
+        cosTh = dot(nProp, mUnit)
+
+        acceptProb = (
+            hkDistScalar(cosTh, t)
+            / (rejection(t)*vMFDist(cosTh, kappa))
+        )
+
+        if np.random.random() < acceptProb:
+            return nProp
+
+
+def hkDistScalar(cosTh, t):
+    """
+    Practical S^2 heat-kernel density used for sampling. cosTh is assumed to be a single scalar value
+    """
+
+    #cosTh = np.asarray(cosTh, dtype=float)
+    th = np.arccos(np.clip(cosTh, -1, 1))
+
+    # spectral representation for moderate and large diffusion times
+    if t >= 0.15:
+        return hkSpectralAdaptive(cosTh, t)
+
+    # only check the boundary-layer cutoff in the tiny antipodal region
+    thCheck = 2.90569
+    if th > thCheck and th > thBL(t) :
+        return hkBL(th, t)
+
+    return hkMPSD(th, t)
+
+def hkPi(t, nMin=-1, nMax=0):
+    """Camporesi image sum evaluated exactly at theta = pi,
+       truncated to nMin <= n <= nMax.
+    """
+    
+    imageSum = 0.0
+
+    for n in range(nMin, nMax + 1):
+        sign = 1 if n % 2 == 0 else -1
+
+        imageSum += (
+            sign
+            * (2 * n + 1)
+            * np.exp(
+                -np.pi**2 * (2 * n + 1)**2 / (4 * t)
+            )
+        )
+
+    prefactor = (
+        np.pi**2
+        * np.exp(t / 4)
+        / (4 * np.pi * t)**1.5
+    )
+
+    return prefactor * imageSum
+
+
+# minimum t for which each lMax is sufficiently accurate
+# (so lMax=0 is good enough for t > 6.2, lMax=1 is for 6.2 > t > 2.2 etc.)
+# the minimum t for the score is set using an independent bound on the error
+# So lMax=1 is good enough for t > 2.51, lMax=2 is for 2.51 > t > 1.06 etc.
+spectralTMin = [6.2, 2.2, 1.1, 0.65, 0.44, 0.32, 0.24, 0.19, 0.15, 0.12, 0.1]
+spectralTMinScore = [2.51, 1.06, 0.619, 0.423, 0.317, 0.252, 0.208, 0.177, 0.154, 0.135]
+
+def lMaxValue(t):
+    for lMax in range(len(spectralTMin)):
+        if t >= spectralTMin[lMax]:
+            return lMax
+
+    raise ValueError(
+        f"Spectral approximation not calibrated below t={spectralTMin[-1]}"
+    )
+
+def lMaxValueScore(t):
+    for l in range(len(spectralTMinScore)):
+        if t >= spectralTMin[l]:
+            return l+1
+
+    raise ValueError(
+        f"Spectral approximation not calibrated below t={spectralTMin[-1]}"
+    )
+    
+def hkSpectralAdaptive(cosTh, t):
+    """
+    Spectral S^2 heat kernel with lMax chosen from calibrated
+    accuracy thresholds.
+    """
+
+    return hkSpectral(cosTh, t, lMaxValue(t))
+
+def hkSpectralAdaptiveScore(cosTh, t):
+
+    return hkSpectralScore(cosTh, t, lMaxValueScore(t))
