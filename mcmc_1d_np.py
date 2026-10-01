@@ -122,6 +122,11 @@ def energy(cfgs):
     bonds = sphere.dot(cfgs, np.roll(cfgs, -1, axis=-2))
     return -np.sum(bonds, axis=-2)[..., 0]
 
+def exactEnergy(L, beta, ellMax=50):
+    """
+    Exact mean energy of the periodic 1D O(3) chain.
+    """
+    return -L * exactCorrelation(L, beta, ellMax)[1]
 
 def energyVariance(cfgs):
     """Ensemble variance of H, using the population variance (ddof=0)."""

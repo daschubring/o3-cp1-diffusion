@@ -1,7 +1,7 @@
 import numpy as np
 import matplotlib.pyplot as plt
-import sphere
-import sde
+import sphere_np as sphere
+import sde_np as sde
 import torch
 import importlib
 from model import MLP
