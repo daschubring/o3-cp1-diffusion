@@ -7,6 +7,12 @@ def randomSpins(nCfg, L, device=None, dtype=torch.float32):
     """Generate nCfg independent random spin configurations on S^2."""
     spins = torch.randn((nCfg, L, L, 3), device=device, dtype=dtype)
     return sphere.normalize(spins)
+    
+def constantSpins(nCfg, L, device=None, dtype=torch.float32):
+    """Generate nCfg constant spin configurations on S^2."""
+    spins = torch.randn((nCfg, 3), device=device, dtype=dtype)
+    spins = sphere.normalize(spins).reshape((nCfg, 1, 1, 3))
+    return spins.expand(nCfg, L, L, 3).clone()
 
 
 def heatBathStep(m, beta):
@@ -31,7 +37,7 @@ def heatBathStep(m, beta):
 
     return sphere.vMF(mUnit, kappa)
 
-def heatBathSweep(spins, beta):
+def heatBathSweep(spins, beta, fixed=False):
 
     A = spins[..., 0::2, 0::2, :]
     B = spins[..., 0::2, 1::2, :]
@@ -54,7 +60,16 @@ def heatBathSweep(spins, beta):
         + torch.roll(B, -1, dims=-3)
     )
 
-    A[...] = heatBathStep(mA, beta)
+    newA = heatBathStep(mA, beta)
+
+    if fixed:
+        # Fine-lattice sites (4m,4n) are A[..., ::2, ::2, :]
+        A[..., 0::2, 1::2, :] = newA[..., 0::2, 1::2, :]
+        A[..., 1::2, 0::2, :] = newA[..., 1::2, 0::2, :]
+        A[..., 1::2, 1::2, :] = newA[..., 1::2, 1::2, :]
+    else:
+        A[...] = newA
+
     D[...] = heatBathStep(mD, beta)
 
     # ----- odd checkerboard: B and C -----
@@ -80,10 +95,10 @@ def heatBathSweep(spins, beta):
 
 from tqdm.notebook import tqdm
 
-def heatBath(spins, beta, nSweeps=1):
+def heatBath(spins, beta, nSweeps=1, fixed=False):
     """Perform nSweeps checkerboard heat-bath sweeps in place."""
     for _ in tqdm(range(nSweeps)):
-        heatBathSweep(spins, beta)
+        heatBathSweep(spins, beta, fixed=fixed)
     return spins
 
 def correlation(cfgs):
@@ -97,24 +112,45 @@ def correlation(cfgs):
       - all lattice sites
       - both spatial directions
     """
-    L = cfgs.shape[-2]
+    # OLD VERSION (new FFT version is much quicker):
+    # L = cfgs.shape[-2]
 
-    corr = torch.empty(L, device=cfgs.device, dtype=cfgs.dtype)
+    # corr = torch.empty(L, device=cfgs.device, dtype=cfgs.dtype)
 
-    for r in range(L):
-        corrX = torch.sum(
-            torch.roll(cfgs, -r, dims=-2) * cfgs,
-            dim=-1
-        ).mean()
+    # for r in range(L):
+    #     corrX = torch.sum(
+    #         torch.roll(cfgs, -r, dims=-2) * cfgs,
+    #         dim=-1
+    #     ).mean()
 
-        corrY = torch.sum(
-            torch.roll(cfgs, -r, dims=-3) * cfgs,
-            dim=-1
-        ).mean()
+    #     corrY = torch.sum(
+    #         torch.roll(cfgs, -r, dims=-3) * cfgs,
+    #         dim=-1
+    #     ).mean()
 
-        corr[r] = 0.5 * (corrX + corrY)
+    #     corr[r] = 0.5 * (corrX + corrY)
 
-    return corr
+    # return corr
+
+    corr = corrMatrix(cfgs)
+    return .5*(corr[0]+corr.T[0])
+
+def corrMatrix(x):
+    """
+        Full L x L matrix of correlations
+    """
+    B, L, _, _ = x.shape
+
+    # Fourier transform over the two lattice directions
+    f = torch.fft.fft2(x, dim=(-3, -2))
+
+    # sum power over O(3) components
+    power = (f.abs()**2).sum(dim=-1)
+
+    # inverse transform gives correlation at every displacement
+    C = torch.fft.ifft2(power, dim=(-2, -1)).real
+
+    return C.mean(dim=0) / (L * L)
 
 def exactScore(x, beta):
     """The exact score at a field configuration x, assuming the equilibrium distribution """
@@ -207,3 +243,134 @@ def correlationLength(x):
 
     return xi
 
+def gaussianInterpSetup(corr):
+    """
+    Precompute everything needed for fast Gaussian interpolation.
+
+    corr: (64,64) dot-product covariance C(dx,dy)
+
+    Returns:
+        sqrtSpectrum : Fourier-space sqrt covariance for one Cartesian component
+        M            : conditioning matrix K_{.C} K_CC^{-1}
+    """
+    L = corr.shape[0]
+    device = corr.device
+    dtype = corr.dtype
+
+    # ------------------------------------------------------------
+    # 1. Fourier spectrum of one Cartesian component.
+    #
+    # <s_i^a s_j^b> = (1/3) K_ij delta_ab
+    # ------------------------------------------------------------
+
+    spectrum = torch.fft.fft2(corr).real / 3.0
+
+    # Protect against tiny negative eigenvalues from roundoff/statistics
+    spectrum = torch.clamp(spectrum, min=0.0)
+
+    sqrtSpectrum = torch.sqrt(spectrum)
+
+
+    # ------------------------------------------------------------
+    # 2. Build K_{.C} and K_CC
+    # ------------------------------------------------------------
+
+    i, j = torch.meshgrid(
+        torch.arange(L, device=device),
+        torch.arange(L, device=device),
+        indexing='ij'
+    )
+
+    coords = torch.stack((i.flatten(), j.flatten()), dim=1)
+
+    coarse = (
+        (coords[:, 0] % 4 == 0)
+        & (coords[:, 1] % 4 == 0)
+    )
+
+    coarse_idx = torch.where(coarse)[0]
+
+    # displacement from every fine site to every coarse site
+    d = (coords[:, None, :] - coords[coarse_idx][None, :, :]) % L
+
+    # K_{.C}: (4096,256)
+    KallC = corr[d[..., 0], d[..., 1]]
+
+    # K_CC: select coarse rows
+    KCC = KallC[coarse_idx]
+
+    # M = K_{.C} K_CC^{-1}
+    #
+    # Solve K_CC M^T = K_{.C}^T rather than explicitly invert.
+    M = torch.linalg.solve(KCC, KallC.T).T
+
+    return sqrtSpectrum, M
+
+def gaussianInterpolate(coarse, sqrtSpectrum, M):
+    """
+    Fast conditional-Gaussian interpolation.
+
+    coarse: (B,16,16,3)
+
+    returns:
+        x: (B,64,64,3)
+    """
+
+    B = coarse.shape[0]
+    L = 64
+    device = coarse.device
+    dtype = coarse.dtype
+
+    # ------------------------------------------------------------
+    # 1. Draw unconditional Gaussian field z ~ N(0,K/3)
+    #
+    # Start with real white noise. FFT -> multiply by sqrt spectrum
+    # -> inverse FFT.
+    # ------------------------------------------------------------
+
+    noise = torch.randn(B, L, L, 3, device=device, dtype=dtype)
+
+    noiseK = torch.fft.fft2(noise, dim=(-3, -2))
+
+    z = torch.fft.ifft2(
+        noiseK * sqrtSpectrum[None, :, :, None],
+        dim=(-3, -2)
+    ).real
+
+
+    # ------------------------------------------------------------
+    # 2. Measure mismatch at coarse sites
+    # ------------------------------------------------------------
+
+    zCoarse = z[:, ::4, ::4, :]
+
+    delta = coarse - zCoarse
+
+    # (B,256,3)
+    delta = delta.reshape(B, -1, 3)
+
+
+    # ------------------------------------------------------------
+    # 3. Propagate the correction to every site
+    #
+    # correction = K_{.C} K_CC^{-1} (x_C - z_C)
+    # ------------------------------------------------------------
+
+    correction = torch.einsum(
+        'ij,bjk->bik',
+        M,
+        delta
+    )
+
+    # ------------------------------------------------------------
+    # 4. Add correction
+    # ------------------------------------------------------------
+
+    x = z.reshape(B, L * L, 3) + correction
+    x = x.reshape(B, L, L, 3)
+
+    # Mathematically redundant, but guarantees exact anchor values
+    # rather than ~1e-6 numerical agreement.
+    x[:, ::4, ::4, :] = coarse
+
+    return x
