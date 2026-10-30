@@ -26,15 +26,15 @@ def rotFromQ(q):
     z, w, x, y = q.unbind(dim=-1)
 
     col0 = torch.stack((
-        1 - 2*(y*y + z*z),
-        2*(x*y + w*z),
-        2*(x*z - w*y)
+        -1 + 2*(y*y + z*z),
+        -2*(x*y + w*z),
+        -2*(x*z - w*y)
     ), dim=-1)
 
     col1 = torch.stack((
-        2*(x*y - w*z),
-        1 - 2*(x*x + z*z),
-        2*(y*z + w*x)
+        -2*(x*y - w*z),
+        -1 + 2*(x*x + z*z),
+        -2*(y*z + w*x)
     ), dim=-1)
 
     col2 = torch.stack((
@@ -100,3 +100,21 @@ def qFromV(v):
     ), dim=-1)
 
     return q
+
+def gaugeRotateQ(q, alpha):
+    """
+    Apply z -> exp(i*alpha) z to quaternion coordinates.
+    q: (..., 4)
+    alpha: broadcastable to q[..., 0]
+    """
+    c = torch.cos(alpha)
+    s = torch.sin(alpha)
+
+    q0, q1, q2, q3 = q.unbind(-1)
+
+    return torch.stack((
+        c*q0 - s*q1,
+        s*q0 + c*q1,
+        c*q2 - s*q3,
+        s*q2 + c*q3
+    ), dim=-1)

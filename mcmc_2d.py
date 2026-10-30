@@ -14,7 +14,6 @@ def constantSpins(nCfg, L, device=None, dtype=torch.float32):
     spins = sphere.normalize(spins).reshape((nCfg, 1, 1, 3))
     return spins.expand(nCfg, L, L, 3).clone()
 
-
 def heatBathStep(m, beta):
     """
     Sample new O(3) spins in the local field m.
@@ -243,7 +242,7 @@ def correlationLength(x):
 
     return xi
 
-def gaussianInterpSetup(corr):
+def gaussianInterpSetup(corr, scale=4):
     """
     Precompute everything needed for fast Gaussian interpolation.
 
@@ -284,8 +283,8 @@ def gaussianInterpSetup(corr):
     coords = torch.stack((i.flatten(), j.flatten()), dim=1)
 
     coarse = (
-        (coords[:, 0] % 4 == 0)
-        & (coords[:, 1] % 4 == 0)
+        (coords[:, 0] % scale == 0)
+        & (coords[:, 1] % scale == 0)
     )
 
     coarse_idx = torch.where(coarse)[0]
@@ -306,7 +305,39 @@ def gaussianInterpSetup(corr):
 
     return sqrtSpectrum, M
 
-def gaussianInterpolate(coarse, sqrtSpectrum, M):
+
+def linearInterpolate(coarse, M, scale=4, L=64):
+    """
+    Covariance-based linear interpolation.
+
+    coarse: (B,16,16,3)
+
+    returns:
+        x: (B,64,64,3)
+    """
+
+    B = coarse.shape[0]
+    device = coarse.device
+    dtype = coarse.dtype
+
+    # (B,256,3)
+    coarseFlat = coarse.reshape(B, -1, 3)
+
+    mean = torch.einsum(
+        'ij,bjk->bik',
+        M,
+        coarseFlat
+    )
+
+    x = mean.reshape(B, L, L, 3)
+
+    # Mathematically redundant, but guarantees exact anchor values
+    # rather than ~1e-6 numerical agreement.
+    x[:, ::scale, ::scale, :] = coarse
+
+    return x
+
+def gaussianInterpolate(coarse, sqrtSpectrum, M, scale=4, L=64):
     """
     Fast conditional-Gaussian interpolation.
 
@@ -317,7 +348,6 @@ def gaussianInterpolate(coarse, sqrtSpectrum, M):
     """
 
     B = coarse.shape[0]
-    L = 64
     device = coarse.device
     dtype = coarse.dtype
 
@@ -342,7 +372,7 @@ def gaussianInterpolate(coarse, sqrtSpectrum, M):
     # 2. Measure mismatch at coarse sites
     # ------------------------------------------------------------
 
-    zCoarse = z[:, ::4, ::4, :]
+    zCoarse = z[:, ::scale, ::scale, :]
 
     delta = coarse - zCoarse
 
@@ -371,6 +401,6 @@ def gaussianInterpolate(coarse, sqrtSpectrum, M):
 
     # Mathematically redundant, but guarantees exact anchor values
     # rather than ~1e-6 numerical agreement.
-    x[:, ::4, ::4, :] = coarse
+    x[:, ::scale, ::scale, :] = coarse
 
     return x

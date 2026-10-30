@@ -81,3 +81,5 @@ def quenchStep(x, t, ds, score):
     xNew = expMap(x, v)
 
     return xNew
+
+
